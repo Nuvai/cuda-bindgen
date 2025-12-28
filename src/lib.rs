@@ -20,7 +20,7 @@ pub struct Builder {
     include_paths: Vec<PathBuf>,
     compute_cap: Option<usize>,
     out_dir: PathBuf,
-    extra_args: Vec<&'static str>,
+    extra_args: Vec<String>,
 }
 
 impl Default for Builder {
@@ -163,8 +163,8 @@ impl Builder {
     /// ```no_run
     /// let builder = bindgen_cuda::Builder::default().arg("--expt-relaxed-constexpr");
     /// ```
-    pub fn arg(mut self, arg: &'static str) -> Self {
-        self.extra_args.push(arg);
+    pub fn arg<S: AsRef<str>>(mut self, arg: S) -> Self {
+        self.extra_args.push(arg.as_ref().to_string());
         self
     }
 
