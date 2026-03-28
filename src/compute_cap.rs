@@ -1,5 +1,21 @@
 use crate::error::{Error, Result};
 
+/// Parse leading digits from a string, ignoring trailing letters (e.g. "120a" → 120).
+fn parse_digits(s: &str) -> Option<i32> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Parse a flat compute cap from a string that may have a trailing letter suffix.
+/// e.g. "120" → 120, "120a" → 120
+pub(crate) fn parse_compute_cap_digits(s: &str) -> Option<usize> {
+    // Try direct parse first, then strip trailing non-digits
+    s.parse::<usize>().ok().or_else(|| {
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    })
+}
+
 /// CUDA compute capability (major.minor) for a device.
 ///
 /// Implements `Display` as a two-digit code (e.g. `90` for 9.0).
@@ -66,19 +82,19 @@ pub fn get_from_nvidia_smi() -> Result<ComputeCapability> {
         .next()
         .ok_or_else(|| Error::DetectionFailed("empty nvidia-smi output".into()))?;
 
-    let parts: Vec<&str> = cap_str.trim().split('.').collect();
+    let cap_str = cap_str.trim();
+    let parts: Vec<&str> = cap_str.split('.').collect();
     if parts.len() < 2 {
         return Err(Error::DetectionFailed(format!(
             "unexpected nvidia-smi format: {cap_str:?}"
         )));
     }
 
-    let major: i32 = parts[0]
-        .parse()
-        .map_err(|_| Error::DetectionFailed(format!("bad major version: {:?}", parts[0])))?;
-    let minor: i32 = parts[1]
-        .parse()
-        .map_err(|_| Error::DetectionFailed(format!("bad minor version: {:?}", parts[1])))?;
+    // Strip trailing letter suffixes (e.g. "12.0a" → major=12, minor=0)
+    let major: i32 = parse_digits(parts[0])
+        .ok_or_else(|| Error::DetectionFailed(format!("bad major version: {:?}", parts[0])))?;
+    let minor: i32 = parse_digits(parts[1])
+        .ok_or_else(|| Error::DetectionFailed(format!("bad minor version: {:?}", parts[1])))?;
 
     Ok(ComputeCapability { major, minor })
 }
@@ -93,12 +109,13 @@ pub fn get_from_nvidia_smi() -> Result<ComputeCapability> {
 pub fn detect() -> Result<ComputeCapability> {
     // 1. Environment variable override
     if let Ok(cap_str) = std::env::var("CUDA_COMPUTE_CAP") {
-        // Support both "80" and "8.0" formats
+        // Support "80", "8.0", and letter-suffixed "120a" formats
         let cap_str = cap_str.trim().replace('.', "");
-        if let Ok(flat) = cap_str.parse::<usize>() {
+        if let Some(flat) = parse_compute_cap_digits(&cap_str) {
             let major = (flat / 10) as i32;
             let minor = (flat % 10) as i32;
-            println!("cargo:rustc-env=CUDA_COMPUTE_CAP={flat}");
+            // Preserve original value (including letter suffix) for downstream consumers
+            println!("cargo:rustc-env=CUDA_COMPUTE_CAP={}", cap_str);
             return Ok(ComputeCapability { major, minor });
         }
     }

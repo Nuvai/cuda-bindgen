@@ -13,16 +13,22 @@ pub mod error;
 use error::{Error, Result};
 
 /// Core builder for setting up CUDA kernel compilation options.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Builder {
     cuda_root: Option<PathBuf>,
     kernel_paths: Vec<PathBuf>,
     watch: Vec<PathBuf>,
     include_paths: Vec<PathBuf>,
+    /// Single compute capability (legacy). Ignored when `compute_caps` is set.
     compute_cap: Option<usize>,
+    /// Multiple compute capabilities for fat binary / multi-gencode builds.
+    compute_caps: Option<Vec<usize>>,
     out_dir: PathBuf,
     extra_args: Vec<String>,
 }
+
+/// Default compute capabilities used when `CUDA_COMPUTE_CAPS=all`.
+const DEFAULT_COMPUTE_CAPS: &[usize] = &[75, 80, 86, 89, 90];
 
 impl Default for Builder {
     fn default() -> Self {
@@ -53,8 +59,8 @@ impl Default for Builder {
         let extra_args = vec![];
         let watch = vec![];
 
-        // Detect compute capability — None if detection fails (not a panic)
-        let compute_cap = compute_cap::detect().ok().map(|c| c.as_flat());
+        // Detect compute capabilities from env vars
+        let (compute_cap, compute_caps) = detect_compute_caps();
 
         Self {
             cuda_root,
@@ -63,6 +69,7 @@ impl Default for Builder {
             include_paths,
             extra_args,
             compute_cap,
+            compute_caps,
             out_dir,
         }
     }
@@ -157,27 +164,61 @@ impl Builder {
     }
 
     /// Force the CUDA root to a specific directory.
-    pub fn cuda_root<P: Into<PathBuf>>(&mut self, path: P) {
+    pub fn cuda_root<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.cuda_root = Some(path.into());
+        self
     }
 
-    /// Manually set the CUDA compute capability (flat code, e.g. `86` for 8.6).
+    /// Manually set a single CUDA compute capability (flat code, e.g. `86` for 8.6).
     ///
     /// This overrides auto-detection from `CUDA_COMPUTE_CAP` env, cudarc, and nvidia-smi.
+    /// For multi-architecture fat binaries, use [`compute_caps`](Self::compute_caps) instead.
     pub fn compute_cap(mut self, compute_cap: usize) -> Self {
         self.compute_cap = Some(compute_cap);
         self
     }
 
+    /// Set multiple compute capabilities for fat binary / multi-gencode builds.
+    ///
+    /// When multiple CCs are set:
+    /// - `build_lib` compiles with `-gencode` flags for each architecture
+    /// - `build_ptx` compiles for the lowest CC (forward-compatible via JIT)
+    ///
+    /// This takes priority over `compute_cap` and `CUDA_COMPUTE_CAP`.
+    /// See also `CUDA_COMPUTE_CAPS` env var (comma-separated, or `all`).
+    pub fn compute_caps(mut self, caps: Vec<usize>) -> Self {
+        self.compute_caps = Some(caps);
+        self
+    }
+
+    /// Resolve the effective list of compute capabilities.
+    ///
+    /// Priority: `compute_caps` (multi) > `compute_cap` (single).
+    /// Returns `Err(NoComputeCap)` if none are available.
+    fn resolved_caps(&self) -> Result<Vec<usize>> {
+        if let Some(caps) = &self.compute_caps {
+            if caps.is_empty() {
+                return Err(Error::NoComputeCap);
+            }
+            return Ok(caps.clone());
+        }
+        match self.compute_cap {
+            Some(cap) => Ok(vec![cap]),
+            None => Err(Error::NoComputeCap),
+        }
+    }
+
     /// Build a static library from the kernel sources.
     ///
+    /// When multiple compute capabilities are configured (via [`compute_caps`](Self::compute_caps)
+    /// or `CUDA_COMPUTE_CAPS`), uses `-gencode` flags for fat binary builds.
+    ///
     /// Link with `println!("cargo:rustc-link-lib=<name>");` in your build.rs.
-    pub fn build_lib<P: Into<PathBuf>>(self, out_file: P) {
+    /// Returns `Err` instead of panicking when compute cap is unavailable or compilation fails.
+    pub fn build_lib<P: Into<PathBuf>>(&self, out_file: P) -> Result<()> {
         let out_file = out_file.into();
-        let compute_cap = self
-            .compute_cap
-            .expect("No compute capability available. Set CUDA_COMPUTE_CAP env var.");
-        let out_dir = self.out_dir;
+        let caps = self.resolved_caps()?;
+        let out_dir = &self.out_dir;
 
         for path in &self.watch {
             println!("cargo:rerun-if-changed={}", path.display());
@@ -227,13 +268,25 @@ impl Builder {
         };
 
         let ccbin_env = std::env::var("NVCC_CCBIN");
+        let use_gencode = caps.len() > 1;
+
         if should_compile {
             cu_files
                 .par_iter()
                 .map(|(cu_file, obj_file)| {
                     let mut command = std::process::Command::new("nvcc");
+                    #[cfg(windows)]
+                    command.args(["-Xcompiler", "/Zc:preprocessor", "-DNOGDI"]);
+                    if use_gencode {
+                        for cap in &caps {
+                            command.arg(format!(
+                                "-gencode=arch=compute_{cap},code=sm_{cap}"
+                            ));
+                        }
+                    } else {
+                        command.arg(format!("--gpu-architecture=sm_{}", caps[0]));
+                    }
                     command
-                        .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                         .arg("-c")
                         .args(["-o", obj_file.to_str().expect("valid outfile")])
                         .args(["--default-stream", "per-thread"])
@@ -246,20 +299,19 @@ impl Builder {
                     command.arg(cu_file);
                     let output = command
                         .spawn()
-                        .expect("failed spawning nvcc")
+                        .map_err(|e| Error::CompilationFailed(format!("nvcc failed to start: {e}")))?
                         .wait_with_output()
-                        .expect("capture nvcc output");
+                        .map_err(|e| Error::CompilationFailed(format!("nvcc failed: {e}")))?;
                     if !output.status.success() {
-                        panic!(
-                            "nvcc error compiling: {command:?}\n\n# stdout\n{}\n\n# stderr\n{}",
+                        return Err(Error::CompilationFailed(format!(
+                            "nvcc error compiling {cu_file:?}:\n\n# CLI {command:?}\n\n# stdout\n{}\n\n# stderr\n{}",
                             String::from_utf8_lossy(&output.stdout),
                             String::from_utf8_lossy(&output.stderr)
-                        );
+                        )));
                     }
                     Ok(())
                 })
-                .collect::<std::result::Result<(), std::io::Error>>()
-                .expect("compile kernel files");
+                .collect::<Result<()>>()?;
 
             let obj_files: Vec<_> = cu_files.iter().map(|c| c.1.clone()).collect();
             let mut command = std::process::Command::new("nvcc");
@@ -272,34 +324,45 @@ impl Builder {
                 .args(obj_files);
             let output = command
                 .spawn()
-                .expect("failed spawning nvcc")
+                .map_err(|e| Error::CompilationFailed(format!("nvcc linker failed to start: {e}")))?
                 .wait_with_output()
-                .expect("run nvcc linker");
+                .map_err(|e| Error::CompilationFailed(format!("nvcc linker failed: {e}")))?;
             if !output.status.success() {
-                panic!(
-                    "nvcc link error: {command:?}\n\n# stdout\n{}\n\n# stderr\n{}",
+                return Err(Error::CompilationFailed(format!(
+                    "nvcc link error:\n\n# CLI {command:?}\n\n# stdout\n{}\n\n# stderr\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
-                );
+                )));
             }
         }
+
+        // Expose resolved caps for downstream
+        let caps_str: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
+        println!("cargo:rustc-env=CUDA_COMPUTE_CAPS={}", caps_str.join(","));
+
+        Ok(())
     }
 
     /// Build PTX files from each kernel source.
     ///
+    /// When multiple compute capabilities are configured, compiles for the lowest CC
+    /// since PTX is forward-compatible via JIT compilation on newer GPUs.
+    ///
     /// Returns [`Bindings`] which can write a Rust source file with `include_str!` constants.
     /// Returns `Err` instead of panicking when compute cap or CUDA root is unavailable.
-    pub fn build_ptx(self) -> Result<Bindings> {
-        let cuda_root = self.cuda_root.ok_or(Error::NoCudaRoot)?;
-        let compute_cap = self.compute_cap.ok_or(Error::NoComputeCap)?;
+    pub fn build_ptx(&self) -> Result<Bindings> {
+        let cuda_root = self.cuda_root.as_ref().ok_or(Error::NoCudaRoot)?;
+        let caps = self.resolved_caps()?;
+        // PTX is forward-compatible — compile for the lowest CC
+        let compute_cap = *caps.iter().min().unwrap();
         let cuda_include_dir = cuda_root.join("include");
         println!(
             "cargo:rustc-env=CUDA_INCLUDE_DIR={}",
             cuda_include_dir.display()
         );
-        let out_dir = self.out_dir;
+        let out_dir = &self.out_dir;
 
-        let mut include_paths = self.include_paths;
+        let mut include_paths = self.include_paths.clone();
         for path in &mut include_paths {
             println!("cargo:rerun-if-changed={}", path.display());
             let destination =
@@ -312,7 +375,6 @@ impl Builder {
         include_paths.sort();
         include_paths.dedup();
 
-        #[allow(unused)]
         let mut include_options: Vec<String> = include_paths
             .into_iter()
             .map(|s| {
@@ -337,7 +399,7 @@ impl Builder {
                 println!("cargo:rerun-if-changed={}", p.display());
                 let mut output = p.clone();
                 output.set_extension("ptx");
-                let output_filename = Path::new(&out_dir)
+                let output_filename = Path::new(out_dir)
                     .to_path_buf()
                     .join("out")
                     .with_file_name(output.file_name().expect("kernel should have a filename"));
@@ -358,6 +420,8 @@ impl Builder {
                     None
                 } else {
                     let mut command = std::process::Command::new("nvcc");
+                    #[cfg(windows)]
+                    command.args(["-Xcompiler", "/Zc:preprocessor", "-DNOGDI"]);
                     command
                         .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                         .arg("--ptx")
@@ -408,7 +472,7 @@ impl Builder {
 
         Ok(Bindings {
             write,
-            paths: self.kernel_paths,
+            paths: self.kernel_paths.clone(),
         })
     }
 }
@@ -447,11 +511,15 @@ fn cuda_include_dir() -> Option<PathBuf> {
     let env_vars = [
         "CUDA_PATH",
         "CUDA_ROOT",
+        "CUDA_HOME",
         "CUDA_TOOLKIT_ROOT_DIR",
         "CUDNN_LIB",
     ];
 
-    #[allow(unused)]
+    for var in &env_vars {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+
     let env_vars = env_vars
         .into_iter()
         .map(std::env::var)
@@ -463,17 +531,74 @@ fn cuda_include_dir() -> Option<PathBuf> {
         "/usr/local/cuda",
         "/opt/cuda",
         "/usr/lib/cuda",
+        "/usr/local/cuda-12",
+        "/usr/local/cuda-11",
         "C:/Program Files/NVIDIA GPU Computing Toolkit",
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA",
         "C:/CUDA",
     ];
 
-    println!("cargo:info={roots:?}");
-
     let roots = roots.into_iter().map(Into::<PathBuf>::into);
+
+    // Also check versioned /usr/local/cuda-* directories
+    let versioned = glob::glob("/usr/local/cuda-*")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.ok());
 
     env_vars
         .chain(roots)
+        .chain(versioned)
         .find(|path| path.join("include").join("cuda.h").is_file())
+}
+
+/// Detect compute capabilities from environment variables, with fallback to single-cap detection.
+///
+/// Priority:
+/// 1. `CUDA_COMPUTE_CAPS` (plural, comma-separated, or `all` for default set)
+/// 2. `CUDA_COMPUTE_CAP` / cudarc / nvidia-smi (single cap, via `compute_cap::detect`)
+///
+/// Returns `(Option<single>, Option<multi>)`.
+fn detect_compute_caps() -> (Option<usize>, Option<Vec<usize>>) {
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAPS");
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+
+    // 1. Check CUDA_COMPUTE_CAPS (plural) first
+    if let Ok(caps_str) = std::env::var("CUDA_COMPUTE_CAPS") {
+        let caps_str = caps_str.trim();
+        if caps_str.eq_ignore_ascii_case("all") {
+            let caps = DEFAULT_COMPUTE_CAPS.to_vec();
+            println!(
+                "cargo:rustc-env=CUDA_COMPUTE_CAPS={}",
+                caps.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+            );
+            return (None, Some(caps));
+        }
+
+        let caps: Vec<usize> = caps_str
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim().replace('.', "");
+                compute_cap::parse_compute_cap_digits(&s)
+            })
+            .collect();
+
+        if !caps.is_empty() {
+            let mut caps = caps;
+            caps.sort();
+            caps.dedup();
+            println!(
+                "cargo:rustc-env=CUDA_COMPUTE_CAPS={}",
+                caps.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+            );
+            return (None, Some(caps));
+        }
+    }
+
+    // 2. Fallback to single compute cap detection
+    let compute_cap = compute_cap::detect().ok().map(|c| c.as_flat());
+    (compute_cap, None)
 }
 
 /// Validate that nvcc supports the detected compute capability.
