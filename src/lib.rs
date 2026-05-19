@@ -89,7 +89,7 @@ pub struct Builder {
     compute_cap: Option<usize>,
     compute_caps: Vec<usize>,
     out_dir: PathBuf,
-    extra_args: Vec<&'static str>,
+    extra_args: Vec<String>,
     output_format: OutputFormat,
     rdc: bool,
     dlto: bool,
@@ -269,8 +269,8 @@ impl Builder {
     /// ```no_run
     /// let builder = bindgen_cuda::Builder::default().arg("--expt-relaxed-constexpr");
     /// ```
-    pub fn arg(mut self, arg: &'static str) -> Self {
-        self.extra_args.push(arg);
+    pub fn arg<S: AsRef<str>>(mut self, arg: S) -> Self {
+        self.extra_args.push(arg.as_ref().to_string());
         self
     }
 
@@ -279,11 +279,9 @@ impl Builder {
     /// ```no_run
     /// let builder = bindgen_cuda::Builder::default().cuda_root("/usr/local/cuda");
     /// ```
-    pub fn cuda_root<P>(&mut self, path: P)
-    where
-        P: Into<PathBuf>,
-    {
+    pub fn cuda_root<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.cuda_root = Some(path.into());
+        self
     }
 
     /// Sets the CUDA compute capability manually.
@@ -461,28 +459,39 @@ impl Builder {
         self
     }
 
-    fn arch_flags(&self) -> Vec<String> {
+    /// Returns the resolved list of compute capabilities.
+    /// Prefers `compute_caps` (multi-arch) over `compute_cap` (single).
+    pub fn resolved_caps(&self) -> error::Result<Vec<usize>> {
         if !self.compute_caps.is_empty() {
-            self.compute_caps
+            Ok(self.compute_caps.clone())
+        } else if let Some(cap) = self.compute_cap {
+            Ok(vec![cap])
+        } else {
+            Err(Error::NoComputeCap)
+        }
+    }
+
+    fn arch_flags(&self) -> error::Result<Vec<String>> {
+        let caps = self.resolved_caps()?;
+        if caps.len() > 1 {
+            Ok(caps
                 .iter()
                 .map(|cap| {
                     format!(
                         "-gencode=arch=compute_{cap},code=[sm_{cap},compute_{cap}]"
                     )
                 })
-                .collect()
-        } else if let Some(cap) = self.compute_cap {
-            vec![format!("--gpu-architecture=sm_{cap}")]
+                .collect())
         } else {
-            panic!("No compute capability set. Use compute_cap() or compute_caps().");
+            Ok(vec![format!("--gpu-architecture=sm_{}", caps[0])])
         }
     }
 
-    fn apply_common_flags(&self, command: &mut std::process::Command) {
+    fn apply_common_flags(&self, command: &mut std::process::Command) -> error::Result<()> {
         #[cfg(windows)]
         command.args(["-Xcompiler", "/Zc:preprocessor", "-DNOGDI"]);
 
-        command.args(self.arch_flags());
+        command.args(self.arch_flags()?);
         command.args(["--default-stream", "per-thread"]);
 
         if self.rdc {
@@ -532,15 +541,17 @@ impl Builder {
         }
 
         command.args(&self.extra_args);
+        Ok(())
     }
 
-    /// Consumes the builder and create a lib in the out_dir.
+    /// Builds a static library from the CUDA kernel files.
     /// It then needs to be linked against in your `build.rs`
     /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().build_lib("libflash.a");
+    /// let builder = bindgen_cuda::Builder::default();
+    /// builder.build_lib("libflash.a").unwrap();
     /// println!("cargo:rustc-link-lib=flash");
     /// ```
-    pub fn build_lib<P>(self, out_file: P)
+    pub fn build_lib<P>(&self, out_file: P) -> error::Result<()>
     where
         P: Into<PathBuf>,
     {
@@ -591,11 +602,13 @@ impl Builder {
         };
         let ccbin_env = std::env::var("NVCC_CCBIN");
         if should_compile {
-            cu_files
+            let compile_errors: Vec<_> = cu_files
             .par_iter()
-            .map(|(cu_file, obj_file)| {
+            .filter_map(|(cu_file, obj_file)| {
                 let mut command = std::process::Command::new("nvcc");
-                self.apply_common_flags(&mut command);
+                if let Err(e) = self.apply_common_flags(&mut command) {
+                    return Some(format!("flag error: {e}"));
+                }
                 command
                     .arg("-c")
                     .args(["-o", obj_file.to_str().expect("valid outfile")]);
@@ -605,43 +618,44 @@ impl Builder {
                         .args(["-ccbin", ccbin_path]);
                 }
                 command.arg(cu_file);
-                let output = command
-                    .spawn()
-                    .expect("failed spawning nvcc")
-                    .wait_with_output().expect("capture nvcc output");
+                let output = match command.spawn().and_then(|c| c.wait_with_output()) {
+                    Ok(o) => o,
+                    Err(e) => return Some(format!("nvcc failed to start: {e}")),
+                };
                 if !output.status.success() {
-                    panic!(
-                        "nvcc error while executing compiling: {:?}\n\n# stdout\n{:#}\n\n# stderr\n{:#}",
-                        &command,
+                    return Some(format!(
+                        "nvcc error compiling {:?}:\n# stdout\n{}\n# stderr\n{}",
+                        cu_file,
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
-                    )
+                    ));
                 }
-                Ok(())
+                None
             })
-            .collect::<Result<(), std::io::Error>>().expect("compile files correctly");
+            .collect();
+
+            if !compile_errors.is_empty() {
+                return Err(Error::CompilationFailed(compile_errors.join("\n\n")));
+            }
 
             if self.device_link {
                 let obj_files = cu_files.iter().map(|c| c.1.clone()).collect::<Vec<_>>();
                 let dlink_file = out_dir.join("dlink.o");
                 let mut command = std::process::Command::new("nvcc");
-                self.apply_common_flags(&mut command);
+                self.apply_common_flags(&mut command)?;
                 command
                     .arg("--device-link")
                     .args(["-o", dlink_file.to_str().expect("valid dlink path")])
                     .args(&obj_files);
-                let output = command
-                    .spawn()
-                    .expect("failed spawning nvcc")
-                    .wait_with_output()
-                    .expect("Run nvcc device-link");
+                let output = command.spawn()
+                    .and_then(|c| c.wait_with_output())
+                    .map_err(|e| Error::CompilationFailed(format!("nvcc device-link failed to start: {e}")))?;
                 if !output.status.success() {
-                    panic!(
-                        "nvcc error while device-linking: {:?}\n\n# stdout\n{:#}\n\n# stderr\n{:#}",
-                        &command,
+                    return Err(Error::CompilationFailed(format!(
+                        "nvcc device-link error:\n# stdout\n{}\n# stderr\n{}",
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
-                    )
+                    )));
                 }
             }
 
@@ -654,23 +668,21 @@ impl Builder {
                 .arg("--lib")
                 .args([
                     "-o",
-                    out_file.to_str().expect("library file {out_file} to exist"),
+                    out_file.to_str().expect("valid library output path"),
                 ])
                 .args(obj_files);
-            let output = command
-                .spawn()
-                .expect("failed spawning nvcc")
-                .wait_with_output()
-                .expect("Run nvcc");
+            let output = command.spawn()
+                .and_then(|c| c.wait_with_output())
+                .map_err(|e| Error::CompilationFailed(format!("nvcc lib failed to start: {e}")))?;
             if !output.status.success() {
-                panic!(
-                    "nvcc error while linking: {:?}\n\n# stdout\n{:#}\n\n# stderr\n{:#}",
-                    &command,
+                return Err(Error::CompilationFailed(format!(
+                    "nvcc lib error:\n# stdout\n{}\n# stderr\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
-                )
+                )));
             }
         }
+        Ok(())
     }
 
     /// Consumes the builder and outputs compiled kernel files (PTX, CUBIN, or Fatbin
@@ -682,8 +694,8 @@ impl Builder {
     /// let bindings = bindgen_cuda::Builder::default().build_ptx().unwrap();
     /// bindings.write("src/lib.rs").unwrap();
     /// ```
-    pub fn build_ptx(self) -> Result<Bindings, Error> {
-        let cuda_root = self.cuda_root.clone().expect("Could not find CUDA in standard locations, set it manually using Builder().set_cuda_root(...)");
+    pub fn build_ptx(&self) -> error::Result<Bindings> {
+        let cuda_root = self.cuda_root.clone().ok_or(Error::NoCudaRoot)?;
         let cuda_include_dir = cuda_root.join("include");
         println!(
             "cargo:rustc-env=CUDA_INCLUDE_DIR={}",
@@ -745,7 +757,9 @@ impl Builder {
                     None
                 } else {
                     let mut command = std::process::Command::new("nvcc");
-                    self.apply_common_flags(&mut command);
+                    if let Err(e) = self.apply_common_flags(&mut command) {
+                        return Some(Err(e));
+                    }
                     command
                         .arg(format_flag)
                         .args(["--output-directory", &out_dir.display().to_string()])
@@ -756,25 +770,31 @@ impl Builder {
                             .args(["-ccbin", ccbin_path]);
                     }
                     command.arg(p);
-                    Some((p, format!("{command:?}"), command.spawn()
-                        .expect("nvcc failed to start. Ensure that you have CUDA installed and that `nvcc` is in your PATH.").wait_with_output()))
+                    let result = command.spawn()
+                        .and_then(|c| c.wait_with_output());
+                    Some(Ok((p, format!("{command:?}"), result)))
                 }
             })
             .collect::<Vec<_>>();
 
         let existing_paths: Vec<PathBuf> = glob::glob(&format!("{0}/**/*.{extension}", out_dir.display()))
-            .expect("valid glob")
-            .map(|p| p.expect("valid path"))
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.ok())
             .collect();
         let write = !children.is_empty() || self.kernel_paths.len() < existing_paths.len();
-        for (kernel_path, command, child) in children {
-            let output = child.expect("nvcc failed to run. Ensure that you have CUDA installed and that `nvcc` is in your PATH.");
-            assert!(
-                output.status.success(),
-                "nvcc error while compiling {kernel_path:?}:\n\n# CLI {command} \n\n# stdout\n{:#}\n\n# stderr\n{:#}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        for item in children {
+            let (kernel_path, command, child) = item?;
+            let output = child.map_err(|e| {
+                Error::CompilationFailed(format!("nvcc failed to run: {e}"))
+            })?;
+            if !output.status.success() {
+                return Err(Error::CompilationFailed(format!(
+                    "nvcc error compiling {kernel_path:?}:\n# CLI {command}\n# stdout\n{}\n# stderr\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
         }
         Ok(Bindings {
             write,
@@ -788,7 +808,7 @@ impl Bindings {
     /// Writes a helper rust file that will include the compiled kernel sources as constants.
     /// For PTX output, constants are `&str` via `include_str!`.
     /// For CUBIN/Fatbin output, constants are `&[u8]` via `include_bytes!`.
-    pub fn write<P>(&self, out: P) -> Result<(), Error>
+    pub fn write<P>(&self, out: P) -> error::Result<()>
     where
         P: AsRef<Path>,
     {
