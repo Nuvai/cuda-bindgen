@@ -1,2 +1,8 @@
 /target
 Cargo.lock
+/examples/**/target/
+
+# Auto-added by Nuvai session-start-governance-check
+.nuvai/reports
+.nuvai/governance-check.ts
+.DS_Store
