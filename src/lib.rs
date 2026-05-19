@@ -11,6 +11,68 @@ use std::str::FromStr;
 #[derive(Debug)]
 pub enum Error {}
 
+/// CUDA C++ standard version for `--std` flag.
+#[derive(Debug, Clone, Copy)]
+pub enum CudaStd {
+    /// C++03
+    Cpp03,
+    /// C++11
+    Cpp11,
+    /// C++14
+    Cpp14,
+    /// C++17
+    Cpp17,
+    /// C++20
+    Cpp20,
+}
+
+impl CudaStd {
+    fn as_flag(self) -> &'static str {
+        match self {
+            CudaStd::Cpp03 => "--std=c++03",
+            CudaStd::Cpp11 => "--std=c++11",
+            CudaStd::Cpp14 => "--std=c++14",
+            CudaStd::Cpp17 => "--std=c++17",
+            CudaStd::Cpp20 => "--std=c++20",
+        }
+    }
+}
+
+/// Optimization level for device code.
+#[derive(Debug, Clone, Copy)]
+pub enum OptLevel {
+    /// No optimization (`-O0`)
+    O0,
+    /// Low optimization (`-O1`)
+    O1,
+    /// Default optimization (`-O2`)
+    O2,
+    /// Aggressive optimization (`-O3`)
+    O3,
+}
+
+impl OptLevel {
+    fn as_flag(self) -> &'static str {
+        match self {
+            OptLevel::O0 => "-O0",
+            OptLevel::O1 => "-O1",
+            OptLevel::O2 => "-O2",
+            OptLevel::O3 => "-O3",
+        }
+    }
+}
+
+/// Output format for compiled CUDA code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// PTX assembly (default)
+    Ptx,
+    /// CUBIN (device binary for a specific architecture)
+    Cubin,
+    /// Fatbin (bundles PTX + CUBIN for portability and performance)
+    Fatbin,
+}
+
 /// Core builder to setup the bindings options
 #[derive(Debug)]
 pub struct Builder {
@@ -19,8 +81,25 @@ pub struct Builder {
     watch: Vec<PathBuf>,
     include_paths: Vec<PathBuf>,
     compute_cap: Option<usize>,
+    compute_caps: Vec<usize>,
     out_dir: PathBuf,
     extra_args: Vec<&'static str>,
+    output_format: OutputFormat,
+    rdc: bool,
+    dlto: bool,
+    opt_level: Option<OptLevel>,
+    device_debug: bool,
+    line_info: bool,
+    cuda_std: Option<CudaStd>,
+    fast_math: bool,
+    xcompiler_args: Vec<String>,
+    device_link: bool,
+    defines: Vec<(String, Option<String>)>,
+    ptxas_options: Vec<String>,
+    resource_usage: bool,
+    verbose: bool,
+    dryrun: bool,
+    max_reg_count: Option<usize>,
 }
 
 impl Default for Builder {
@@ -56,15 +135,33 @@ impl Default for Builder {
             include_paths,
             extra_args,
             compute_cap,
+            compute_caps: vec![],
             out_dir,
+            output_format: OutputFormat::Ptx,
+            rdc: false,
+            dlto: false,
+            opt_level: None,
+            device_debug: false,
+            line_info: false,
+            cuda_std: None,
+            fast_math: false,
+            xcompiler_args: vec![],
+            device_link: false,
+            defines: vec![],
+            ptxas_options: vec![],
+            resource_usage: false,
+            verbose: false,
+            dryrun: false,
+            max_reg_count: None,
         }
     }
 }
 
-/// Helper struct to create a rust file when buildings PTX files.
+/// Helper struct to create a rust file that includes compiled kernel sources.
 pub struct Bindings {
     write: bool,
     paths: Vec<PathBuf>,
+    output_format: OutputFormat,
 }
 
 fn default_kernels() -> Option<Vec<PathBuf>> {
@@ -194,6 +291,240 @@ impl Builder {
         self
     }
 
+    /// Sets multiple CUDA compute capabilities for multi-arch / fat binary builds.
+    /// Each capability generates a separate `-gencode` flag with both PTX and SM targets.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default()
+    ///     .compute_caps(vec![75, 86, 90]); // Target Turing + Ampere + Hopper
+    /// ```
+    pub fn compute_caps(mut self, caps: Vec<usize>) -> Self {
+        self.compute_caps = caps;
+        self
+    }
+
+    /// Sets the output format: PTX (default), CUBIN, or Fatbin.
+    /// Fatbin bundles PTX + CUBIN for portability and performance.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default()
+    ///     .output_format(bindgen_cuda::OutputFormat::Fatbin);
+    /// ```
+    pub fn output_format(mut self, format: OutputFormat) -> Self {
+        self.output_format = format;
+        self
+    }
+
+    /// Enables relocatable device code (`-rdc=true`).
+    /// Required for separate compilation, dynamic parallelism, and device-side linking.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().rdc(true);
+    /// ```
+    pub fn rdc(mut self, enable: bool) -> Self {
+        self.rdc = enable;
+        self
+    }
+
+    /// Enables device link-time optimization (`-dlto`). Requires CUDA 11.2+.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().dlto(true);
+    /// ```
+    pub fn dlto(mut self, enable: bool) -> Self {
+        self.dlto = enable;
+        self
+    }
+
+    /// Sets the optimization level for device code.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default()
+    ///     .opt_level(bindgen_cuda::OptLevel::O3);
+    /// ```
+    pub fn opt_level(mut self, level: OptLevel) -> Self {
+        self.opt_level = Some(level);
+        self
+    }
+
+    /// Enables device debugging (`-G`). Disables optimizations on device code.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().device_debug(true);
+    /// ```
+    pub fn device_debug(mut self, enable: bool) -> Self {
+        self.device_debug = enable;
+        self
+    }
+
+    /// Enables generation of line number information (`-lineinfo`).
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().line_info(true);
+    /// ```
+    pub fn line_info(mut self, enable: bool) -> Self {
+        self.line_info = enable;
+        self
+    }
+
+    /// Sets the C++ standard version for CUDA compilation.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default()
+    ///     .cuda_std(bindgen_cuda::CudaStd::Cpp17);
+    /// ```
+    pub fn cuda_std(mut self, std: CudaStd) -> Self {
+        self.cuda_std = Some(std);
+        self
+    }
+
+    /// Enables `--use_fast_math` for aggressive floating-point optimizations.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().fast_math(true);
+    /// ```
+    pub fn fast_math(mut self, enable: bool) -> Self {
+        self.fast_math = enable;
+        self
+    }
+
+    /// Adds a host compiler flag via `-Xcompiler`.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default()
+    ///     .xcompiler("-fPIC")
+    ///     .xcompiler("-march=native");
+    /// ```
+    pub fn xcompiler(mut self, flag: &str) -> Self {
+        self.xcompiler_args.push(flag.to_string());
+        self
+    }
+
+    /// Enables device linking (`--device-link`). Required when using RDC across translation units.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().rdc(true).device_link(true);
+    /// ```
+    pub fn device_link(mut self, enable: bool) -> Self {
+        self.device_link = enable;
+        self
+    }
+
+    /// Adds a preprocessor define (`-D`).
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default()
+    ///     .define("DEBUG", None)
+    ///     .define("BLOCK_SIZE", Some("256"));
+    /// ```
+    pub fn define(mut self, name: &str, value: Option<&str>) -> Self {
+        self.defines.push((name.to_string(), value.map(|v| v.to_string())));
+        self
+    }
+
+    /// Adds ptxas options (`--ptxas-options=`).
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().ptxas_options("-v");
+    /// ```
+    pub fn ptxas_options(mut self, opt: &str) -> Self {
+        self.ptxas_options.push(opt.to_string());
+        self
+    }
+
+    /// Enables resource usage reporting (`--resource-usage`).
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().resource_usage(true);
+    /// ```
+    pub fn resource_usage(mut self, enable: bool) -> Self {
+        self.resource_usage = enable;
+        self
+    }
+
+    /// Enables verbose output (`-v`).
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().verbose(true);
+    /// ```
+    pub fn verbose(mut self, enable: bool) -> Self {
+        self.verbose = enable;
+        self
+    }
+
+    /// Enables dry-run mode (`--dryrun`). Shows commands without executing.
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().dryrun(true);
+    /// ```
+    pub fn dryrun(mut self, enable: bool) -> Self {
+        self.dryrun = enable;
+        self
+    }
+
+    /// Sets the maximum register count per thread (`--maxrregcount`).
+    /// ```no_run
+    /// let builder = bindgen_cuda::Builder::default().max_reg_count(32);
+    /// ```
+    pub fn max_reg_count(mut self, count: usize) -> Self {
+        self.max_reg_count = Some(count);
+        self
+    }
+
+    fn arch_flags(&self) -> Vec<String> {
+        if !self.compute_caps.is_empty() {
+            self.compute_caps
+                .iter()
+                .map(|cap| {
+                    format!(
+                        "-gencode=arch=compute_{cap},code=[sm_{cap},compute_{cap}]"
+                    )
+                })
+                .collect()
+        } else if let Some(cap) = self.compute_cap {
+            vec![format!("--gpu-architecture=sm_{cap}")]
+        } else {
+            panic!("No compute capability set. Use compute_cap() or compute_caps().");
+        }
+    }
+
+    fn apply_common_flags(&self, command: &mut std::process::Command) {
+        command.args(self.arch_flags());
+        command.args(["--default-stream", "per-thread"]);
+
+        if self.rdc {
+            command.arg("-rdc=true");
+        }
+        if self.dlto {
+            command.arg("-dlto");
+        }
+        if let Some(level) = self.opt_level {
+            command.arg(level.as_flag());
+        }
+        if self.device_debug {
+            command.arg("-G");
+        }
+        if self.line_info {
+            command.arg("-lineinfo");
+        }
+        if let Some(std) = self.cuda_std {
+            command.arg(std.as_flag());
+        }
+        if self.fast_math {
+            command.arg("--use_fast_math");
+        }
+        for flag in &self.xcompiler_args {
+            command.arg(format!("-Xcompiler={flag}"));
+        }
+        for (name, value) in &self.defines {
+            match value {
+                Some(v) => command.arg(format!("-D{name}={v}")),
+                None => command.arg(format!("-D{name}")),
+            };
+        }
+        for opt in &self.ptxas_options {
+            command.arg(format!("--ptxas-options={opt}"));
+        }
+        if self.resource_usage {
+            command.arg("--resource-usage");
+        }
+        if self.verbose {
+            command.arg("-v");
+        }
+        if self.dryrun {
+            command.arg("--dryrun");
+        }
+        if let Some(count) = self.max_reg_count {
+            command.arg(format!("--maxrregcount={count}"));
+        }
+
+        command.args(&self.extra_args);
+    }
+
     /// Consumes the builder and create a lib in the out_dir.
     /// It then needs to be linked against in your `build.rs`
     /// ```no_run
@@ -205,8 +536,7 @@ impl Builder {
         P: Into<PathBuf>,
     {
         let out_file = out_file.into();
-        let compute_cap = self.compute_cap.expect("Failed to get compute_cap");
-        let out_dir = self.out_dir;
+        let out_dir = self.out_dir.clone();
         for path in &self.watch {
             println!("cargo:rerun-if-changed={}", path.display());
         }
@@ -256,12 +586,10 @@ impl Builder {
             .par_iter()
             .map(|(cu_file, obj_file)| {
                 let mut command = std::process::Command::new("nvcc");
+                self.apply_common_flags(&mut command);
                 command
-                    .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                     .arg("-c")
-                    .args(["-o", obj_file.to_str().expect("valid outfile")])
-                    .args(["--default-stream", "per-thread"])
-                    .args(&self.extra_args);
+                    .args(["-o", obj_file.to_str().expect("valid outfile")]);
                 if let Ok(ccbin_path) = &ccbin_env {
                     command
                         .arg("-allow-unsupported-compiler")
@@ -283,7 +611,35 @@ impl Builder {
                 Ok(())
             })
             .collect::<Result<(), std::io::Error>>().expect("compile files correctly");
-            let obj_files = cu_files.iter().map(|c| c.1.clone()).collect::<Vec<_>>();
+
+            if self.device_link {
+                let obj_files = cu_files.iter().map(|c| c.1.clone()).collect::<Vec<_>>();
+                let dlink_file = out_dir.join("dlink.o");
+                let mut command = std::process::Command::new("nvcc");
+                self.apply_common_flags(&mut command);
+                command
+                    .arg("--device-link")
+                    .args(["-o", dlink_file.to_str().expect("valid dlink path")])
+                    .args(&obj_files);
+                let output = command
+                    .spawn()
+                    .expect("failed spawning nvcc")
+                    .wait_with_output()
+                    .expect("Run nvcc device-link");
+                if !output.status.success() {
+                    panic!(
+                        "nvcc error while device-linking: {:?}\n\n# stdout\n{:#}\n\n# stderr\n{:#}",
+                        &command,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                }
+            }
+
+            let mut obj_files = cu_files.iter().map(|c| c.1.clone()).collect::<Vec<_>>();
+            if self.device_link {
+                obj_files.push(out_dir.join("dlink.o"));
+            }
             let mut command = std::process::Command::new("nvcc");
             command
                 .arg("--lib")
@@ -308,31 +664,37 @@ impl Builder {
         }
     }
 
-    /// Consumes the builder and outputs 1 ptx file for each kernels
-    /// found.
-    /// This function returns [`Bindings`] which can then be unused
+    /// Consumes the builder and outputs compiled kernel files (PTX, CUBIN, or Fatbin
+    /// depending on [`OutputFormat`]).
+    ///
+    /// This function returns [`Bindings`] which can then be used
     /// to create a rust source file that will include those kernels.
     /// ```no_run
     /// let bindings = bindgen_cuda::Builder::default().build_ptx().unwrap();
     /// bindings.write("src/lib.rs").unwrap();
     /// ```
     pub fn build_ptx(self) -> Result<Bindings, Error> {
-        let cuda_root = self.cuda_root.expect("Could not find CUDA in standard locations, set it manually using Builder().set_cuda_root(...)");
-        let compute_cap = self.compute_cap.expect("Could not find compute_cap");
+        let cuda_root = self.cuda_root.clone().expect("Could not find CUDA in standard locations, set it manually using Builder().set_cuda_root(...)");
         let cuda_include_dir = cuda_root.join("include");
         println!(
             "cargo:rustc-env=CUDA_INCLUDE_DIR={}",
             cuda_include_dir.display()
         );
-        let out_dir = self.out_dir;
+        let out_dir = self.out_dir.clone();
+        let output_format = self.output_format;
 
-        let mut include_paths = self.include_paths;
+        let (format_flag, extension) = match output_format {
+            OutputFormat::Ptx => ("--ptx", "ptx"),
+            OutputFormat::Cubin => ("--cubin", "cubin"),
+            OutputFormat::Fatbin => ("--fatbin", "fatbin"),
+        };
+
+        let mut include_paths = self.include_paths.clone();
         for path in &mut include_paths {
             println!("cargo:rerun-if-changed={}", path.display());
             let destination =
                 out_dir.join(path.file_name().expect("include path to have filename"));
             std::fs::copy(path.clone(), destination).expect("copy include headers");
-            // remove the filename from the path so it's just the directory
             path.pop();
         }
 
@@ -360,7 +722,7 @@ impl Builder {
             .flat_map(|p| {
                 println!("cargo:rerun-if-changed={}", p.display());
                 let mut output = p.clone();
-                output.set_extension("ptx");
+                output.set_extension(extension);
                 let output_filename = std::path::Path::new(&out_dir).to_path_buf().join("out").with_file_name(output.file_name().expect("kernel to have a filename"));
 
                 let ignore = if let Ok(metadata) = output_filename.metadata() {
@@ -374,11 +736,10 @@ impl Builder {
                     None
                 } else {
                     let mut command = std::process::Command::new("nvcc");
-                    command.arg(format!("--gpu-architecture=sm_{compute_cap}"))
-                        .arg("--ptx")
-                        .args(["--default-stream", "per-thread"])
+                    self.apply_common_flags(&mut command);
+                    command
+                        .arg(format_flag)
                         .args(["--output-directory", &out_dir.display().to_string()])
-                        .args(&self.extra_args)
                         .args(&include_options);
                     if let Ok(ccbin_path) = &ccbin_env {
                         command
@@ -392,13 +753,11 @@ impl Builder {
             })
             .collect::<Vec<_>>();
 
-        let ptx_paths: Vec<PathBuf> = glob::glob(&format!("{0}/**/*.ptx", out_dir.display()))
+        let existing_paths: Vec<PathBuf> = glob::glob(&format!("{0}/**/*.{extension}", out_dir.display()))
             .expect("valid glob")
-            .map(|p| p.expect("valid path for PTX"))
+            .map(|p| p.expect("valid path"))
             .collect();
-        // We should rewrite `src/lib.rs` only if there are some newly compiled kernels, or removed
-        // some old ones
-        let write = !children.is_empty() || self.kernel_paths.len() < ptx_paths.len();
+        let write = !children.is_empty() || self.kernel_paths.len() < existing_paths.len();
         for (kernel_path, command, child) in children {
             let output = child.expect("nvcc failed to run. Ensure that you have CUDA installed and that `nvcc` is in your PATH.");
             assert!(
@@ -410,19 +769,27 @@ impl Builder {
         }
         Ok(Bindings {
             write,
-            paths: self.kernel_paths,
+            paths: self.kernel_paths.clone(),
+            output_format,
         })
     }
 }
 
 impl Bindings {
-    /// Writes a helper rust file that will include the PTX sources as
-    /// `const KERNEL_NAME` making it easier to interact with the PTX sources.
+    /// Writes a helper rust file that will include the compiled kernel sources as constants.
+    /// For PTX output, constants are `&str` via `include_str!`.
+    /// For CUBIN/Fatbin output, constants are `&[u8]` via `include_bytes!`.
     pub fn write<P>(&self, out: P) -> Result<(), Error>
     where
         P: AsRef<Path>,
     {
         if self.write {
+            let ext = match self.output_format {
+                OutputFormat::Ptx => "ptx",
+                OutputFormat::Cubin => "cubin",
+                OutputFormat::Fatbin => "fatbin",
+            };
+            let use_bytes = matches!(self.output_format, OutputFormat::Cubin | OutputFormat::Fatbin);
             let mut file = std::fs::File::create(out).expect("Create lib in {out}");
             for kernel_path in &self.paths {
                 let name = kernel_path
@@ -430,15 +797,17 @@ impl Bindings {
                     .expect("kernel to have stem")
                     .to_str()
                     .expect("kernel path to be valid");
-                file.write_all(
-                format!(
-                    r#"pub const {}: &str = include_str!(concat!(env!("OUT_DIR"), "/{}.ptx"));"#,
-                    name.to_uppercase().replace('.', "_"),
-                    name
-                )
-                .as_bytes(),
-                )
-                .expect("write to {out}");
+                let const_name = name.to_uppercase().replace('.', "_");
+                let line = if use_bytes {
+                    format!(
+                        r#"pub const {const_name}: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/{name}.{ext}"));"#,
+                    )
+                } else {
+                    format!(
+                        r#"pub const {const_name}: &str = include_str!(concat!(env!("OUT_DIR"), "/{name}.{ext}"));"#,
+                    )
+                };
+                file.write_all(line.as_bytes()).expect("write to {out}");
                 file.write_all(&[b'\n']).expect("write to {out}");
             }
         }
