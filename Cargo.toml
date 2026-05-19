@@ -2,7 +2,8 @@
 authors = ["Nicolas Patry <patry.nicolas@protonmail.com>"]
 name = "bindgen_cuda"
 version = "0.3.3"
-edition = "2021"
+edition = "2024"
+rust-version = "1.97"
 description = """
 Bindgen like interface to build cuda kernels to interact with within Rust.
 """
