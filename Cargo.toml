@@ -19,3 +19,14 @@ documentation = "https://docs.rs/bindgen_cuda/"
 glob = "0.3.1"
 num_cpus = "1.16.0"
 rayon = "1.8.0"
+
+[dependencies.cudarc]
+version = "0.19"
+features = ["std", "cuda-version-from-build-system", "dynamic-loading", "driver", "fallback-latest"]
+default-features = false
+optional = true
+
+[features]
+default = []
+driver-detect = ["dep:cudarc"]
+ci-check = []
