@@ -76,8 +76,11 @@ pub enum OutputFormat {
     Fatbin,
 }
 
+/// Default compute capabilities used when `CUDA_COMPUTE_CAPS=all`.
+const DEFAULT_COMPUTE_CAPS: &[usize] = &[75, 80, 86, 89, 90];
+
 /// Core builder to setup the bindings options
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Builder {
     cuda_root: Option<PathBuf>,
     kernel_paths: Vec<PathBuf>,
@@ -130,7 +133,7 @@ impl Default for Builder {
         let include_paths = default_include().unwrap_or_default();
         let extra_args = vec![];
         let watch = vec![];
-        let compute_cap = detect_compute_cap().ok();
+        let (compute_cap, compute_caps) = detect_compute_caps();
         Self {
             cuda_root,
             kernel_paths,
@@ -138,7 +141,7 @@ impl Default for Builder {
             include_paths,
             extra_args,
             compute_cap,
-            compute_caps: vec![],
+            compute_caps: compute_caps.unwrap_or_default(),
             out_dir,
             output_format: OutputFormat::Ptx,
             rdc: false,
@@ -476,6 +479,9 @@ impl Builder {
     }
 
     fn apply_common_flags(&self, command: &mut std::process::Command) {
+        #[cfg(windows)]
+        command.args(["-Xcompiler", "/Zc:preprocessor", "-DNOGDI"]);
+
         command.args(self.arch_flags());
         command.args(["--default-stream", "per-thread"]);
 
@@ -819,39 +825,140 @@ impl Bindings {
 }
 
 fn cuda_include_dir() -> Option<PathBuf> {
-    // NOTE: copied from cudarc build.rs.
     let env_vars = [
         "CUDA_PATH",
         "CUDA_ROOT",
+        "CUDA_HOME",
         "CUDA_TOOLKIT_ROOT_DIR",
         "CUDNN_LIB",
     ];
+
+    for var in &env_vars {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+
     let env_vars = env_vars
         .into_iter()
         .map(std::env::var)
-        .filter_map(Result::ok)
-        .map(Into::<PathBuf>::into);
+        .filter_map(std::result::Result::ok)
+        .map(PathBuf::from);
 
     let roots = [
         "/usr",
         "/usr/local/cuda",
         "/opt/cuda",
         "/usr/lib/cuda",
+        "/usr/local/cuda-12",
+        "/usr/local/cuda-11",
         "C:/Program Files/NVIDIA GPU Computing Toolkit",
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA",
         "C:/CUDA",
     ];
 
-    println!("cargo:info={roots:?}");
-
     let roots = roots.into_iter().map(Into::<PathBuf>::into);
+
+    let versioned = glob::glob("/usr/local/cuda-*")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.ok());
 
     env_vars
         .chain(roots)
+        .chain(versioned)
         .find(|path| path.join("include").join("cuda.h").is_file())
 }
 
-fn detect_compute_cap() -> Result<usize, error::Error> {
+/// Detect compute capabilities from environment variables, with fallback to single-cap detection.
+///
+/// Priority:
+/// 1. `CUDA_COMPUTE_CAPS` (plural, comma-separated, or `all` for default set)
+/// 2. `CUDA_COMPUTE_CAP` / cudarc / nvidia-smi (single cap, via `compute_cap::detect`)
+fn detect_compute_caps() -> (Option<usize>, Option<Vec<usize>>) {
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAPS");
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
-    let cap = compute_cap::detect()?;
-    Ok(cap.as_flat())
+
+    if let Ok(caps_str) = std::env::var("CUDA_COMPUTE_CAPS") {
+        let caps_str = caps_str.trim();
+        if caps_str.eq_ignore_ascii_case("all") {
+            let caps = DEFAULT_COMPUTE_CAPS.to_vec();
+            println!(
+                "cargo:rustc-env=CUDA_COMPUTE_CAPS={}",
+                caps.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+            );
+            return (None, Some(caps));
+        }
+
+        let caps: Vec<usize> = caps_str
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim().replace('.', "");
+                compute_cap::parse_compute_cap_digits(&s)
+            })
+            .collect();
+
+        if !caps.is_empty() {
+            let mut caps = caps;
+            caps.sort();
+            caps.dedup();
+            println!(
+                "cargo:rustc-env=CUDA_COMPUTE_CAPS={}",
+                caps.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+            );
+            return (None, Some(caps));
+        }
+    }
+
+    let compute_cap = compute_cap::detect().ok().map(|c| c.as_flat());
+    (compute_cap, None)
+}
+
+/// Validate that nvcc supports the given compute capability.
+///
+/// Returns the validated cap, or downgrades if the GPU is newer than nvcc supports.
+pub fn validate_compute_cap_with_nvcc(compute_cap: usize) -> error::Result<usize> {
+    let out = std::process::Command::new("nvcc")
+        .arg("--list-gpu-code")
+        .output()
+        .map_err(|e| Error::DetectionFailed(format!("nvcc not found: {e}")))?;
+
+    if !out.status.success() {
+        return Err(Error::DetectionFailed("nvcc --list-gpu-code failed".into()));
+    }
+
+    let stdout = std::str::from_utf8(&out.stdout)
+        .map_err(|_| Error::DetectionFailed("nvcc output is not valid UTF-8".into()))?;
+
+    let mut codes = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split('_').collect();
+        if !parts.is_empty() && parts.contains(&"sm") {
+            if let Ok(num) = parts[1].parse::<usize>() {
+                codes.push(num);
+            }
+        }
+    }
+    codes.sort();
+
+    if codes.is_empty() {
+        return Err(Error::DetectionFailed("no GPU codes parsed from nvcc".into()));
+    }
+
+    let max_code = *codes.last().unwrap();
+
+    if !codes.contains(&compute_cap) {
+        if compute_cap > max_code {
+            println!(
+                "cargo:warning=GPU compute cap {compute_cap} exceeds nvcc max {max_code}. \
+                 Targeting {max_code} instead."
+            );
+            return Ok(max_code);
+        }
+        return Err(Error::UnsupportedComputeCap {
+            requested: compute_cap,
+            supported: codes,
+        });
+    }
+
+    Ok(compute_cap)
 }
