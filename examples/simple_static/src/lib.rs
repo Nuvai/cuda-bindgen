@@ -19,11 +19,13 @@ mod tests {
         let inp = stream.clone_htod(&data)?;
         let mut out = stream.alloc_zeros::<f32>(100)?;
 
-        let (out_ptr, _out_guard) = out.device_ptr_mut(&stream);
-        let out_ptr = out_ptr as *mut core::ffi::c_void;
-        let (inp_ptr, _inp_guard) = inp.device_ptr(&stream);
-        let inp_ptr = inp_ptr as *const core::ffi::c_void;
-        unsafe { super::launch_sin2(out_ptr, inp_ptr, 100, stream.cu_stream()) };
+        {
+            let (out_ptr, _out_guard) = out.device_ptr_mut(&stream);
+            let out_ptr = out_ptr as *mut core::ffi::c_void;
+            let (inp_ptr, _inp_guard) = inp.device_ptr(&stream);
+            let inp_ptr = inp_ptr as *const core::ffi::c_void;
+            unsafe { super::launch_sin2(out_ptr, inp_ptr, 100, stream.cu_stream()) };
+        }
 
         let out_host: Vec<f32> = stream.clone_dtoh(&out)?;
         assert_eq!(out_host.len(), data.len());
