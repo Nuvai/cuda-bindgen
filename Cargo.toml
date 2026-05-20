@@ -11,8 +11,6 @@ homepage = "https://github.com/Nuvai/cuda-bindgen"
 repository = "https://github.com/Nuvai/cuda-bindgen"
 documentation = "https://docs.rs/bindgen_cuda/"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 glob = "0.3.1"
 num_cpus = "1.16.0"
@@ -20,11 +18,17 @@ rayon = "1.8.0"
 
 [dependencies.cudarc]
 version = "0.19"
+# dynamic-loading uses dlopen at runtime — builds succeed on any platform (including macOS)
+# even without CUDA installed. The driver API calls simply fail at runtime, which our
+# compute_cap::get_from_driver() handles gracefully via Result.
 features = ["std", "cuda-version-from-build-system", "dynamic-loading", "driver", "fallback-latest"]
 default-features = false
 optional = true
 
 [features]
 default = []
+# Use cudarc driver API for compute cap detection (requires CUDA driver at build time).
+# Without this feature, detection falls back to nvidia-smi or CUDA_COMPUTE_CAP env var.
 driver-detect = ["dep:cudarc"]
+# Skip all CUDA detection — always succeed with no compute cap. For CI without GPUs.
 ci-check = []

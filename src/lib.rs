@@ -1,5 +1,5 @@
-#![deny(missing_docs)]
-#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
+#![doc = "Nuvai fork of bindgen_cuda — graceful CUDA kernel building for Rust."]
+
 use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-/// CUDA compute capability detection with 3-tier fallback (env → driver API → nvidia-smi).
+/// CUDA compute capability detection with 3-tier fallback (env -> driver API -> nvidia-smi).
 pub mod compute_cap;
 /// Error types for CUDA kernel building.
 pub mod error;
@@ -79,14 +79,16 @@ pub enum OutputFormat {
 /// Default compute capabilities used when `CUDA_COMPUTE_CAPS=all`.
 const DEFAULT_COMPUTE_CAPS: &[usize] = &[75, 80, 86, 89, 90];
 
-/// Core builder to setup the bindings options
+/// Core builder for setting up CUDA kernel compilation options.
 #[derive(Debug, Clone)]
 pub struct Builder {
     cuda_root: Option<PathBuf>,
     kernel_paths: Vec<PathBuf>,
     watch: Vec<PathBuf>,
     include_paths: Vec<PathBuf>,
+    /// Single compute capability (legacy). Ignored when `compute_caps` is set.
     compute_cap: Option<usize>,
+    /// Multiple compute capabilities for fat binary / multi-gencode builds.
     compute_caps: Vec<usize>,
     out_dir: PathBuf,
     extra_args: Vec<String>,
@@ -110,30 +112,36 @@ pub struct Builder {
 
 impl Default for Builder {
     fn default() -> Self {
-        // Use only physical cores for rayon.
-        // Builds can be super consuming and exhaust resources quite fast
-        // like when building flash attention kernels
         let num_cpus = std::env::var("RAYON_NUM_THREADS").map_or_else(
             |_| num_cpus::get_physical(),
             |s| usize::from_str(&s).expect("RAYON_NUM_THREADS is not set to a valid integer"),
         );
 
+        // Tolerate rayon already being initialized (e.g. when building multiple targets)
         if rayon::ThreadPoolBuilder::new()
             .num_threads(num_cpus)
             .build_global()
             .is_err()
         {
-            // Already initialized, that's fine - can happen when building multiple targets
+            // Already initialized — that's fine
         }
 
-        let out_dir = std::env::var("OUT_DIR").expect("Expected OUT_DIR environement variable to be present, is this running within `build.rs`?").into();
+        let out_dir: PathBuf = std::env::var("OUT_DIR")
+            .expect(
+                "Expected OUT_DIR environment variable to be present. \
+                 Is this running within `build.rs`?",
+            )
+            .into();
 
         let cuda_root = cuda_include_dir();
         let kernel_paths = default_kernels().unwrap_or_default();
         let include_paths = default_include().unwrap_or_default();
         let extra_args = vec![];
         let watch = vec![];
+
+        // Detect compute capabilities from env vars
         let (compute_cap, compute_caps) = detect_compute_caps();
+
         Self {
             cuda_root,
             kernel_paths,
@@ -163,7 +171,8 @@ impl Default for Builder {
     }
 }
 
-/// Helper struct to create a rust file that includes compiled kernel sources.
+/// Helper struct returned by [`Builder::build_ptx`]. Contains compiled kernel paths
+/// and can write a Rust source file with `include_str!` / `include_bytes!` constants.
 pub struct Bindings {
     write: bool,
     paths: Vec<PathBuf>,
@@ -178,6 +187,7 @@ fn default_kernels() -> Option<Vec<PathBuf>> {
             .collect(),
     )
 }
+
 fn default_include() -> Option<Vec<PathBuf>> {
     Some(
         glob::glob("src/**/*.cuh")
@@ -188,108 +198,78 @@ fn default_include() -> Option<Vec<PathBuf>> {
 }
 
 impl Builder {
-    /// Setup the kernel paths. All path must be set at once and be valid files.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().kernel_paths(vec!["src/mykernel.cu"]);
-    /// ```
+    /// Set kernel source paths. All paths must exist.
     pub fn kernel_paths<P: Into<PathBuf>>(mut self, paths: Vec<P>) -> Self {
         let paths: Vec<_> = paths.into_iter().map(|p| p.into()).collect();
-        let inexistent_paths: Vec<_> = paths.iter().filter(|f| !f.exists()).collect();
-        if !inexistent_paths.is_empty() {
-            panic!("Kernels paths do not exist {inexistent_paths:?}");
+        let missing: Vec<_> = paths.iter().filter(|f| !f.exists()).collect();
+        if !missing.is_empty() {
+            panic!("Kernel paths do not exist: {missing:?}");
         }
         self.kernel_paths = paths;
         self
     }
 
-    /// Setup the paths that the lib depend on but does not need to build
-    /// ```no_run
-    /// let builder =
-    /// bindgen_cuda::Builder::default().watch(vec!["kernels/"]);
-    /// ```
+    /// Set paths to watch for changes (triggers recompilation).
     pub fn watch<T, P>(mut self, paths: T) -> Self
     where
         T: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
         let paths: Vec<_> = paths.into_iter().map(|p| p.into()).collect();
-        let inexistent_paths: Vec<_> = paths.iter().filter(|f| !f.exists()).collect();
-        if !inexistent_paths.is_empty() {
-            panic!("Kernels paths do not exist {inexistent_paths:?}");
+        let missing: Vec<_> = paths.iter().filter(|f| !f.exists()).collect();
+        if !missing.is_empty() {
+            panic!("Watch paths do not exist: {missing:?}");
         }
         self.watch = paths;
         self
     }
 
-    /// Setup the kernel paths. All path must be set at once and be valid files.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().include_paths(vec!["src/mykernel.cuh"]);
-    /// ```
+    /// Set include header paths.
     pub fn include_paths<P: Into<PathBuf>>(mut self, paths: Vec<P>) -> Self {
         self.include_paths = paths.into_iter().map(|p| p.into()).collect();
         self
     }
 
-    /// Setup the kernels with a glob.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().kernel_paths_glob("src/**/*.cu");
-    /// ```
+    /// Set kernel paths via a glob pattern.
     pub fn kernel_paths_glob(mut self, glob: &str) -> Self {
         self.kernel_paths = glob::glob(glob)
-            .expect("Invalid blob")
+            .expect("Invalid glob pattern")
             .map(|p| p.expect("Invalid path"))
             .collect();
         self
     }
 
-    /// Setup the include files with a glob.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().kernel_paths_glob("src/**/*.cuh");
-    /// ```
+    /// Set include paths via a glob pattern.
     pub fn include_paths_glob(mut self, glob: &str) -> Self {
         self.include_paths = glob::glob(glob)
-            .expect("Invalid blob")
+            .expect("Invalid glob pattern")
             .map(|p| p.expect("Invalid path"))
             .collect();
         self
     }
 
-    /// Modifies the output directory.
-    /// By default this is
-    /// [OUT_DIR](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts)
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().out_dir("out/");
-    /// ```
+    /// Override the output directory (defaults to `OUT_DIR`).
     pub fn out_dir<P: Into<PathBuf>>(mut self, out_dir: P) -> Self {
         self.out_dir = out_dir.into();
         self
     }
 
-    /// Sets up extra nvcc compile arguments.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().arg("--expt-relaxed-constexpr");
-    /// ```
+    /// Add an extra nvcc compile argument.
     pub fn arg<S: AsRef<str>>(mut self, arg: S) -> Self {
         self.extra_args.push(arg.as_ref().to_string());
         self
     }
 
-    /// Forces the cuda root to a specific directory.
-    /// By default all standard directories will be visited.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().cuda_root("/usr/local/cuda");
-    /// ```
+    /// Force the CUDA root to a specific directory.
     pub fn cuda_root<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.cuda_root = Some(path.into());
         self
     }
 
-    /// Sets the CUDA compute capability manually.
-    /// By default, the compute capability is detected from `nvidia-smi` or the
-    /// `CUDA_COMPUTE_CAP` environment variable.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().compute_cap(86); // For RTX 3090
-    /// ```
+    /// Manually set a single CUDA compute capability (flat code, e.g. `86` for 8.6).
+    ///
+    /// This overrides auto-detection from `CUDA_COMPUTE_CAP` env, cudarc, and nvidia-smi.
+    /// For multi-architecture fat binaries, use [`compute_caps`](Self::compute_caps) instead.
     pub fn compute_cap(mut self, compute_cap: usize) -> Self {
         self.compute_cap = Some(compute_cap);
         self
@@ -297,10 +277,6 @@ impl Builder {
 
     /// Sets multiple CUDA compute capabilities for multi-arch / fat binary builds.
     /// Each capability generates a separate `-gencode` flag with both PTX and SM targets.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default()
-    ///     .compute_caps(vec![75, 86, 90]); // Target Turing + Ampere + Hopper
-    /// ```
     pub fn compute_caps(mut self, caps: Vec<usize>) -> Self {
         self.compute_caps = caps;
         self
@@ -308,10 +284,6 @@ impl Builder {
 
     /// Sets the output format: PTX (default), CUBIN, or Fatbin.
     /// Fatbin bundles PTX + CUBIN for portability and performance.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default()
-    ///     .output_format(bindgen_cuda::OutputFormat::Fatbin);
-    /// ```
     pub fn output_format(mut self, format: OutputFormat) -> Self {
         self.output_format = format;
         self
@@ -319,141 +291,90 @@ impl Builder {
 
     /// Enables relocatable device code (`-rdc=true`).
     /// Required for separate compilation, dynamic parallelism, and device-side linking.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().rdc(true);
-    /// ```
     pub fn rdc(mut self, enable: bool) -> Self {
         self.rdc = enable;
         self
     }
 
     /// Enables device link-time optimization (`-dlto`). Requires CUDA 11.2+.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().dlto(true);
-    /// ```
     pub fn dlto(mut self, enable: bool) -> Self {
         self.dlto = enable;
         self
     }
 
     /// Sets the optimization level for device code.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default()
-    ///     .opt_level(bindgen_cuda::OptLevel::O3);
-    /// ```
     pub fn opt_level(mut self, level: OptLevel) -> Self {
         self.opt_level = Some(level);
         self
     }
 
     /// Enables device debugging (`-G`). Disables optimizations on device code.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().device_debug(true);
-    /// ```
     pub fn device_debug(mut self, enable: bool) -> Self {
         self.device_debug = enable;
         self
     }
 
     /// Enables generation of line number information (`-lineinfo`).
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().line_info(true);
-    /// ```
     pub fn line_info(mut self, enable: bool) -> Self {
         self.line_info = enable;
         self
     }
 
     /// Sets the C++ standard version for CUDA compilation.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default()
-    ///     .cuda_std(bindgen_cuda::CudaStd::Cpp17);
-    /// ```
     pub fn cuda_std(mut self, std: CudaStd) -> Self {
         self.cuda_std = Some(std);
         self
     }
 
     /// Enables `--use_fast_math` for aggressive floating-point optimizations.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().fast_math(true);
-    /// ```
     pub fn fast_math(mut self, enable: bool) -> Self {
         self.fast_math = enable;
         self
     }
 
     /// Adds a host compiler flag via `-Xcompiler`.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default()
-    ///     .xcompiler("-fPIC")
-    ///     .xcompiler("-march=native");
-    /// ```
     pub fn xcompiler(mut self, flag: &str) -> Self {
         self.xcompiler_args.push(flag.to_string());
         self
     }
 
     /// Enables device linking (`--device-link`). Required when using RDC across translation units.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().rdc(true).device_link(true);
-    /// ```
     pub fn device_link(mut self, enable: bool) -> Self {
         self.device_link = enable;
         self
     }
 
     /// Adds a preprocessor define (`-D`).
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default()
-    ///     .define("DEBUG", None)
-    ///     .define("BLOCK_SIZE", Some("256"));
-    /// ```
     pub fn define(mut self, name: &str, value: Option<&str>) -> Self {
         self.defines.push((name.to_string(), value.map(|v| v.to_string())));
         self
     }
 
     /// Adds ptxas options (`--ptxas-options=`).
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().ptxas_options("-v");
-    /// ```
     pub fn ptxas_options(mut self, opt: &str) -> Self {
         self.ptxas_options.push(opt.to_string());
         self
     }
 
     /// Enables resource usage reporting (`--resource-usage`).
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().resource_usage(true);
-    /// ```
     pub fn resource_usage(mut self, enable: bool) -> Self {
         self.resource_usage = enable;
         self
     }
 
     /// Enables verbose output (`-v`).
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().verbose(true);
-    /// ```
     pub fn verbose(mut self, enable: bool) -> Self {
         self.verbose = enable;
         self
     }
 
     /// Enables dry-run mode (`--dryrun`). Shows commands without executing.
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().dryrun(true);
-    /// ```
     pub fn dryrun(mut self, enable: bool) -> Self {
         self.dryrun = enable;
         self
     }
 
     /// Sets the maximum register count per thread (`--maxrregcount`).
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default().max_reg_count(32);
-    /// ```
     pub fn max_reg_count(mut self, count: usize) -> Self {
         self.max_reg_count = Some(count);
         self
@@ -544,22 +465,24 @@ impl Builder {
         Ok(())
     }
 
-    /// Builds a static library from the CUDA kernel files.
-    /// It then needs to be linked against in your `build.rs`
-    /// ```no_run
-    /// let builder = bindgen_cuda::Builder::default();
-    /// builder.build_lib("libflash.a").unwrap();
-    /// println!("cargo:rustc-link-lib=flash");
-    /// ```
+    /// Build a static library from the CUDA kernel files.
+    ///
+    /// When multiple compute capabilities are configured (via [`compute_caps`](Self::compute_caps)
+    /// or `CUDA_COMPUTE_CAPS`), uses `-gencode` flags for fat binary builds.
+    ///
+    /// Link with `println!("cargo:rustc-link-lib=<name>");` in your build.rs.
+    /// Returns `Err` instead of panicking when compute cap is unavailable or compilation fails.
     pub fn build_lib<P>(&self, out_file: P) -> error::Result<()>
     where
         P: Into<PathBuf>,
     {
         let out_file = out_file.into();
         let out_dir = self.out_dir.clone();
+
         for path in &self.watch {
             println!("cargo:rerun-if-changed={}", path.display());
         }
+
         let cu_files: Vec<_> = self
             .kernel_paths
             .iter()
@@ -570,7 +493,7 @@ impl Builder {
                 let mut obj_file = out_dir.join(format!(
                     "{}-{:x}",
                     f.file_stem()
-                        .expect("kernels paths should include a filename")
+                        .expect("kernel path should have a filename")
                         .to_string_lossy(),
                     hash
                 ));
@@ -578,29 +501,33 @@ impl Builder {
                 (f, obj_file)
             })
             .collect();
-        let out_modified: Result<_, _> = out_file.metadata().and_then(|m| m.modified());
+
+        let out_modified: std::result::Result<_, _> =
+            out_file.metadata().and_then(|m| m.modified());
         let should_compile = if let Ok(out_modified) = out_modified {
             let kernel_modified = self.kernel_paths.iter().any(|entry| {
                 let in_modified = entry
                     .metadata()
-                    .expect("kernel {entry} should exist")
+                    .expect("kernel should exist")
                     .modified()
-                    .expect("kernel modified to be accessible");
+                    .expect("modified time accessible");
                 in_modified.duration_since(out_modified).is_ok()
             });
             let watch_modified = self.watch.iter().any(|entry| {
                 let in_modified = entry
                     .metadata()
-                    .expect("watched file {entry} should exist")
+                    .expect("watched file should exist")
                     .modified()
-                    .expect("watch modified should be accessible");
+                    .expect("modified time accessible");
                 in_modified.duration_since(out_modified).is_ok()
             });
             kernel_modified || watch_modified
         } else {
             true
         };
+
         let ccbin_env = std::env::var("NVCC_CCBIN");
+
         if should_compile {
             let compile_errors: Vec<_> = cu_files
             .par_iter()
@@ -663,6 +590,7 @@ impl Builder {
             if self.device_link {
                 obj_files.push(out_dir.join("dlink.o"));
             }
+
             let mut command = std::process::Command::new("nvcc");
             command
                 .arg("--lib")
@@ -685,15 +613,13 @@ impl Builder {
         Ok(())
     }
 
-    /// Consumes the builder and outputs compiled kernel files (PTX, CUBIN, or Fatbin
-    /// depending on [`OutputFormat`]).
+    /// Build compiled kernel files (PTX, CUBIN, or Fatbin depending on [`OutputFormat`]).
     ///
-    /// This function returns [`Bindings`] which can then be used
-    /// to create a rust source file that will include those kernels.
-    /// ```no_run
-    /// let bindings = bindgen_cuda::Builder::default().build_ptx().unwrap();
-    /// bindings.write("src/lib.rs").unwrap();
-    /// ```
+    /// When multiple compute capabilities are configured, compiles for the lowest CC
+    /// since PTX is forward-compatible via JIT compilation on newer GPUs.
+    ///
+    /// Returns [`Bindings`] which can write a Rust source file with `include_str!` / `include_bytes!` constants.
+    /// Returns `Err` instead of panicking when compute cap or CUDA root is unavailable.
     pub fn build_ptx(&self) -> error::Result<Bindings> {
         let cuda_root = self.cuda_root.clone().ok_or(Error::NoCudaRoot)?;
         let cuda_include_dir = cuda_root.join("include");
@@ -714,7 +640,7 @@ impl Builder {
         for path in &mut include_paths {
             println!("cargo:rerun-if-changed={}", path.display());
             let destination =
-                out_dir.join(path.file_name().expect("include path to have filename"));
+                out_dir.join(path.file_name().expect("include path should have filename"));
             std::fs::copy(path.clone(), destination).expect("copy include headers");
             path.pop();
         }
@@ -728,9 +654,9 @@ impl Builder {
                 "-I".to_string()
                     + &s.into_os_string()
                         .into_string()
-                        .expect("include option to be valid string")
+                        .expect("include path should be valid UTF-8")
             })
-            .collect::<Vec<_>>();
+            .collect();
         include_options.push(format!("-I{}", cuda_include_dir.display()));
 
         let ccbin_env = std::env::var("NVCC_CCBIN");
@@ -738,7 +664,9 @@ impl Builder {
         for path in &self.watch {
             println!("cargo:rerun-if-changed={}", path.display());
         }
-        let children = self.kernel_paths
+
+        let children: Vec<_> = self
+            .kernel_paths
             .par_iter()
             .flat_map(|p| {
                 println!("cargo:rerun-if-changed={}", p.display());
@@ -747,12 +675,17 @@ impl Builder {
                 let output_filename = std::path::Path::new(&out_dir).to_path_buf().join("out").with_file_name(output.file_name().expect("kernel to have a filename"));
 
                 let ignore = if let Ok(metadata) = output_filename.metadata() {
-                    let out_modified = metadata.modified().expect("modified to be accessible");
-                    let in_modified = p.metadata().expect("input to have metadata").modified().expect("input metadata to be accessible");
+                    let out_modified = metadata.modified().expect("modified time accessible");
+                    let in_modified = p
+                        .metadata()
+                        .expect("input should have metadata")
+                        .modified()
+                        .expect("input modified time accessible");
                     out_modified.duration_since(in_modified).is_ok()
                 } else {
                     false
                 };
+
                 if ignore {
                     None
                 } else {
@@ -775,7 +708,7 @@ impl Builder {
                     Some(Ok((p, format!("{command:?}"), result)))
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         let existing_paths: Vec<PathBuf> = glob::glob(&format!("{0}/**/*.{extension}", out_dir.display()))
             .into_iter()
@@ -796,6 +729,7 @@ impl Builder {
                 )));
             }
         }
+
         Ok(Bindings {
             write,
             paths: self.kernel_paths.clone(),
@@ -805,7 +739,7 @@ impl Builder {
 }
 
 impl Bindings {
-    /// Writes a helper rust file that will include the compiled kernel sources as constants.
+    /// Writes a helper Rust file that includes compiled kernel sources as constants.
     /// For PTX output, constants are `&str` via `include_str!`.
     /// For CUBIN/Fatbin output, constants are `&[u8]` via `include_bytes!`.
     pub fn write<P>(&self, out: P) -> error::Result<()>
@@ -823,7 +757,7 @@ impl Bindings {
             for kernel_path in &self.paths {
                 let name = kernel_path
                     .file_stem()
-                    .expect("kernel to have stem")
+                    .expect("kernel should have stem")
                     .to_str()
                     .expect("kernel path to be valid");
                 let const_name = name.to_uppercase().replace('.', "_");
@@ -877,6 +811,7 @@ fn cuda_include_dir() -> Option<PathBuf> {
 
     let roots = roots.into_iter().map(Into::<PathBuf>::into);
 
+    // Also check versioned /usr/local/cuda-* directories
     let versioned = glob::glob("/usr/local/cuda-*")
         .ok()
         .into_iter()
@@ -894,10 +829,13 @@ fn cuda_include_dir() -> Option<PathBuf> {
 /// Priority:
 /// 1. `CUDA_COMPUTE_CAPS` (plural, comma-separated, or `all` for default set)
 /// 2. `CUDA_COMPUTE_CAP` / cudarc / nvidia-smi (single cap, via `compute_cap::detect`)
+///
+/// Returns `(Option<single>, Option<multi>)`.
 fn detect_compute_caps() -> (Option<usize>, Option<Vec<usize>>) {
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAPS");
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
 
+    // 1. Check CUDA_COMPUTE_CAPS (plural) first
     if let Ok(caps_str) = std::env::var("CUDA_COMPUTE_CAPS") {
         let caps_str = caps_str.trim();
         if caps_str.eq_ignore_ascii_case("all") {
@@ -929,6 +867,7 @@ fn detect_compute_caps() -> (Option<usize>, Option<Vec<usize>>) {
         }
     }
 
+    // 2. Fallback to single compute cap detection
     let compute_cap = compute_cap::detect().ok().map(|c| c.as_flat());
     (compute_cap, None)
 }
@@ -936,6 +875,7 @@ fn detect_compute_caps() -> (Option<usize>, Option<Vec<usize>>) {
 /// Validate that nvcc supports the given compute capability.
 ///
 /// Returns the validated cap, or downgrades if the GPU is newer than nvcc supports.
+/// This is separated from detection so callers can decide whether to error or fall back.
 pub fn validate_compute_cap_with_nvcc(compute_cap: usize) -> error::Result<usize> {
     let out = std::process::Command::new("nvcc")
         .arg("--list-gpu-code")
@@ -967,6 +907,7 @@ pub fn validate_compute_cap_with_nvcc(compute_cap: usize) -> error::Result<usize
     let max_code = *codes.last().unwrap();
 
     if !codes.contains(&compute_cap) {
+        // If the GPU is newer than what nvcc supports, use the highest nvcc supports
         if compute_cap > max_code {
             println!(
                 "cargo:warning=GPU compute cap {compute_cap} exceeds nvcc max {max_code}. \

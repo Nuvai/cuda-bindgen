@@ -1,12 +1,13 @@
 use crate::error::{Error, Result};
 
+/// Parse leading digits from a string, ignoring trailing letters (e.g. "120a" -> 120).
 fn parse_digits(s: &str) -> Option<i32> {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
 
 /// Parse a flat compute cap from a string that may have a trailing letter suffix.
-/// e.g. "120" → 120, "120a" → 120
+/// e.g. "120" -> 120, "120a" -> 120
 pub(crate) fn parse_compute_cap_digits(s: &str) -> Option<usize> {
     s.parse::<usize>().ok().or_else(|| {
         let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -15,6 +16,8 @@ pub(crate) fn parse_compute_cap_digits(s: &str) -> Option<usize> {
 }
 
 /// CUDA compute capability (major.minor) for a device.
+///
+/// Implements `Display` as a two-digit code (e.g. `90` for 9.0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComputeCapability {
     /// Major version (e.g. 9 for sm_90).
@@ -39,6 +42,7 @@ impl std::fmt::Display for ComputeCapability {
 /// Queries the primary device's compute capability via the CUDA driver API.
 ///
 /// Requires the `driver-detect` feature and a functioning NVIDIA driver.
+/// Returns `Err` (not panic) if the driver is unavailable.
 #[cfg(feature = "driver-detect")]
 pub fn get_from_driver() -> Result<ComputeCapability> {
     let ctx = cudarc::driver::CudaContext::new(0)?;
@@ -47,6 +51,9 @@ pub fn get_from_driver() -> Result<ComputeCapability> {
 }
 
 /// Queries compute capability via `nvidia-smi --query-gpu=compute_cap`.
+///
+/// Returns `Err` if nvidia-smi is missing, the driver isn't responding,
+/// or the output can't be parsed. Never panics.
 pub fn get_from_nvidia_smi() -> Result<ComputeCapability> {
     let output = std::process::Command::new("nvidia-smi")
         .arg("--query-gpu=compute_cap")
@@ -64,6 +71,7 @@ pub fn get_from_nvidia_smi() -> Result<ComputeCapability> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
+    // Guard against nvidia-smi printing an error message despite exit 0
     if stdout.contains("NVIDIA-SMI has failed") {
         return Err(Error::DetectionFailed(
             "NVIDIA driver not responding (nvidia-smi reports failure)".into(),
@@ -83,6 +91,7 @@ pub fn get_from_nvidia_smi() -> Result<ComputeCapability> {
         )));
     }
 
+    // Strip trailing letter suffixes (e.g. "12.0a" -> major=12, minor=0)
     let major: i32 = parse_digits(parts[0])
         .ok_or_else(|| Error::DetectionFailed(format!("bad major version: {:?}", parts[0])))?;
     let minor: i32 = parse_digits(parts[1])
@@ -99,16 +108,20 @@ pub fn get_from_nvidia_smi() -> Result<ComputeCapability> {
 ///
 /// Returns `Err(NoComputeCap)` if all methods fail. Never panics.
 pub fn detect() -> Result<ComputeCapability> {
+    // 1. Environment variable override
     if let Ok(cap_str) = std::env::var("CUDA_COMPUTE_CAP") {
+        // Support "80", "8.0", and letter-suffixed "120a" formats
         let cap_str = cap_str.trim().replace('.', "");
         if let Some(flat) = parse_compute_cap_digits(&cap_str) {
             let major = (flat / 10) as i32;
             let minor = (flat % 10) as i32;
+            // Preserve original value (including letter suffix) for downstream consumers
             println!("cargo:rustc-env=CUDA_COMPUTE_CAP={}", cap_str);
             return Ok(ComputeCapability { major, minor });
         }
     }
 
+    // 2. CUDA driver API (most reliable when driver is loaded)
     #[cfg(feature = "driver-detect")]
     {
         match get_from_driver() {
@@ -122,6 +135,7 @@ pub fn detect() -> Result<ComputeCapability> {
         }
     }
 
+    // 3. nvidia-smi fallback
     match get_from_nvidia_smi() {
         Ok(cap) => {
             println!("cargo:rustc-env=CUDA_COMPUTE_CAP={cap}");
