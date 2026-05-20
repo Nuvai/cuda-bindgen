@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["dylib"]
 
 [build-dependencies]
-bindgen_cuda = { version = "0.1.6", path = "../.." }
+bindgen_cuda = { version = "0.3.3", path = "../.." }
 
 [dev-dependencies]
 cudarc = { version = "0.19.7", default-features = false, features = ["cuda-version-from-build-system", "dynamic-linking", "driver", "runtime"] }
